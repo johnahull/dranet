@@ -33,6 +33,7 @@ import (
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
+	metadatav1alpha1 "k8s.io/dynamic-resource-allocation/api/metadata/v1alpha1"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
 	"k8s.io/dynamic-resource-allocation/resourceslice"
 	"k8s.io/klog/v2"
@@ -64,6 +65,7 @@ type inventoryDB interface {
 	IsIBOnlyDevice(deviceName string) bool
 	GetRDMADeviceName(deviceName string) (string, error)
 	GetDeviceConfig(deviceName string) (*apis.NetworkConfig, bool)
+	GetPCIAddress(deviceName string) (string, error)
 	AddPodNetNs(podKey string, netNs string)
 	RemovePodNetNs(podKey string)
 	GetPodNetNs(podKey string) (netNs string)
@@ -106,6 +108,7 @@ type NetworkDriver struct {
 	rdmaSharedMode bool
 	podConfigStore *PodConfigStore
 	dbPath         string // path for persistent bbolt database; empty means in-memory
+	cdiMgr         *cdiManager
 
 	clock clock.WithTicker // Injectable clock for testing
 }
@@ -128,6 +131,7 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		nodeName:       nodeName,
 		kubeClient:     kubeClient,
 		rdmaSharedMode: rdmaNetnsMode == apis.RdmaNetnsModeShared,
+		cdiMgr:         newCDIManager("/var/run/cdi"),
 		clock:          clock.RealClock{},
 	}
 
@@ -163,6 +167,8 @@ func Start(ctx context.Context, driverName string, kubeClient kubernetes.Interfa
 		kubeletplugin.DriverName(driverName),
 		kubeletplugin.NodeName(nodeName),
 		kubeletplugin.KubeClient(kubeClient),
+		kubeletplugin.EnableDeviceMetadata(true),
+		kubeletplugin.MetadataVersions(metadatav1alpha1.SchemeGroupVersion),
 	}
 	d, err := kubeletplugin.Start(ctx, plugin, kubeletOpts...)
 	if err != nil {

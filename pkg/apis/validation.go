@@ -62,6 +62,35 @@ func ValidateConfig(raw *runtime.RawExtension) (*NetworkConfig, []error) {
 	// Apply defaults
 	config.Default()
 
+	// Validate Mode
+	switch config.Mode {
+	case "", ModeNetdev:
+		// default netdev mode, proceed with normal validation
+	case ModeVFIO:
+		// VFIO mode: reject network-specific configuration fields
+		if config.Interface.Name != "" || len(config.Interface.Addresses) > 0 || config.Interface.DHCP != nil ||
+			config.Interface.MTU != nil || config.Interface.HardwareAddr != nil || config.Interface.VRF != nil ||
+			config.Interface.Forwarding != nil {
+			allErrors = append(allErrors, fmt.Errorf("mode \"vfio\" does not support interface configuration (addresses, DHCP, MTU, VRF, etc.)"))
+		}
+		if len(config.Routes) > 0 {
+			allErrors = append(allErrors, fmt.Errorf("mode \"vfio\" does not support routes"))
+		}
+		if len(config.Rules) > 0 {
+			allErrors = append(allErrors, fmt.Errorf("mode \"vfio\" does not support rules"))
+		}
+		if len(config.Neighbors) > 0 {
+			allErrors = append(allErrors, fmt.Errorf("mode \"vfio\" does not support neighbors"))
+		}
+		if config.Ethtool != nil {
+			allErrors = append(allErrors, fmt.Errorf("mode \"vfio\" does not support ethtool"))
+		}
+		return &config, allErrors
+	default:
+		allErrors = append(allErrors, fmt.Errorf("unsupported mode %q, expected \"netdev\" or \"vfio\"", config.Mode))
+		return &config, allErrors
+	}
+
 	// Validate InterfaceConfig
 	allErrors = append(allErrors, validateInterfaceConfig(&config.Interface, "interface")...)
 

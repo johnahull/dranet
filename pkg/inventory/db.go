@@ -526,6 +526,21 @@ func (db *DB) GetDeviceConfig(deviceName string) (*apis.NetworkConfig, bool) {
 	return conf, exists
 }
 
+// GetPCIAddress returns the PCI bus address for a given device.
+func (db *DB) GetPCIAddress(deviceName string) (string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	device, exists := db.deviceStore[deviceName]
+	if !exists {
+		return "", fmt.Errorf("device %s not found", deviceName)
+	}
+	attr, ok := device.Attributes[apis.AttrPCIAddress]
+	if !ok || attr.StringValue == nil {
+		return "", fmt.Errorf("device %s has no PCI address", deviceName)
+	}
+	return *attr.StringValue, nil
+}
+
 // GetNetInterfaceName returns the network interface name for a given device. It
 // first attempts to retrieve the name from the local device store. If the
 // device is not found, it triggers a rescan of the system's devices and retries

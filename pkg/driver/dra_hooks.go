@@ -60,6 +60,7 @@ func (np *NetworkDriver) PublishResources(ctx context.Context) {
 		case devices := <-np.netdb.GetResources(ctx):
 			klog.V(3).Infof("Got %d devices from inventory: %s", len(devices), formatDeviceNames(devices, 15))
 			devices = filter.FilterDevices(np.celProgram, devices)
+			devices = filter.MarkVFIOUnsafe(devices)
 			klog.V(3).Infof("After filtering, publishing %d devices in ResourceSlice(s): %s", len(devices), formatDeviceNames(devices, 15))
 
 			np.publishResourcesPrometheusMetrics(devices)
@@ -158,6 +159,8 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 		return kubeletplugin.PrepareResult{}
 	}
 
+	var prepareResult kubeletplugin.PrepareResult
+
 	nlHandle, err := nlwrap.NewHandle()
 	if err != nil {
 		return kubeletplugin.PrepareResult{
@@ -223,6 +226,78 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 				Name:      claim.Name,
 			},
 			NetworkInterfaceConfigInPod: netconf,
+		}
+
+		// VFIO path: bind device to vfio-pci and generate CDI spec.
+		if netconf.Mode == apis.ModeVFIO {
+			pciAddr, err := np.netdb.GetPCIAddress(result.Device)
+			if err != nil {
+				errorList = append(errorList, fmt.Errorf("VFIO mode requires a PCI device: %v", err))
+				continue
+			}
+
+			originalDriver, err := bindVFIOPCI(pciAddr)
+			if err != nil {
+				errorList = append(errorList, fmt.Errorf("failed to bind %s to vfio-pci: %v", pciAddr, err))
+				continue
+			}
+
+			devFileHost, devFileContainer, err := getVFIODeviceFile(pciAddr)
+			if err != nil {
+				if restoreErr := restoreDriver(pciAddr, originalDriver); restoreErr != nil {
+					klog.Errorf("Failed to restore driver for %s after VFIO error: %v", pciAddr, restoreErr)
+				}
+				errorList = append(errorList, fmt.Errorf("failed to get VFIO device file for %s: %v", pciAddr, err))
+				continue
+			}
+
+			vfioCfg := &VFIOConfig{
+				PCIAddress:           pciAddr,
+				OriginalDriver:       originalDriver,
+				VFIOGroupDevPath:     devFileHost,
+				VFIOContainerDevPath: devFileContainer,
+			}
+
+			cdiDeviceID, err := np.cdiMgr.CreateVFIOSpec(string(claim.UID), result.Device, vfioCfg)
+			if err != nil {
+				if restoreErr := restoreDriver(pciAddr, originalDriver); restoreErr != nil {
+					klog.Errorf("Failed to restore driver for %s after CDI error: %v", pciAddr, restoreErr)
+				}
+				errorList = append(errorList, fmt.Errorf("failed to create CDI spec for %s: %v", pciAddr, err))
+				continue
+			}
+
+			deviceCfg.VFIODevice = vfioCfg
+			var storeErr error
+			for _, uid := range podUIDs {
+				if err := np.podConfigStore.SetDeviceConfig(uid, result.Device, deviceCfg); err != nil {
+					storeErr = fmt.Errorf("failed to store VFIO config for pod %s device %s: %v", uid, result.Device, err)
+					break
+				}
+			}
+			if storeErr != nil {
+				if restoreErr := restoreDriver(pciAddr, originalDriver); restoreErr != nil {
+					klog.Errorf("Failed to restore driver for %s after config store error: %v", pciAddr, restoreErr)
+				}
+				if delErr := np.cdiMgr.DeleteSpec(string(claim.UID)); delErr != nil {
+					klog.Errorf("Failed to delete CDI spec after config store error: %v", delErr)
+				}
+				errorList = append(errorList, storeErr)
+				continue
+			}
+
+			prepareResult.Devices = append(prepareResult.Devices, kubeletplugin.Device{
+				Requests:     []string{requestName},
+				PoolName:     np.nodeName,
+				DeviceName:   result.Device,
+				CDIDeviceIDs: []string{cdiDeviceID},
+				Metadata: &kubeletplugin.DeviceMetadata{
+					Attributes: map[string]resourceapi.DeviceAttribute{
+						"resource.kubernetes.io/pciBusID": {StringValue: &pciAddr},
+					},
+				},
+			})
+			continue
 		}
 
 		// IB-only path: device has RDMA capability but no netdev interface.
@@ -407,11 +482,9 @@ func (np *NetworkDriver) prepareResourceClaim(ctx context.Context, claim *resour
 
 	if len(errorList) > 0 {
 		klog.Infof("claim %s contain errors: %v", claim.UID, errors.Join(errorList...))
-		return kubeletplugin.PrepareResult{
-			Err: fmt.Errorf("claim %s contain errors: %w", claim.UID, errors.Join(errorList...)),
-		}
+		prepareResult.Err = fmt.Errorf("claim %s contain errors: %w", claim.UID, errors.Join(errorList...))
 	}
-	return kubeletplugin.PrepareResult{}
+	return prepareResult
 }
 
 func (np *NetworkDriver) UnprepareResourceClaims(ctx context.Context, claims []kubeletplugin.NamespacedObject) (map[types.UID]error, error) {
@@ -458,7 +531,29 @@ func (np *NetworkDriver) unprepareResourceClaims(ctx context.Context, claims []k
 }
 
 func (np *NetworkDriver) unprepareResourceClaim(_ context.Context, claim kubeletplugin.NamespacedObject) error {
-	np.podConfigStore.DeleteClaim(claim.NamespacedName)
+	// Restore VFIO device drivers and clean up CDI specs before removing config.
+	claimNN := claim.NamespacedName
+	for _, podUID := range np.podConfigStore.ListPods() {
+		podConfig, ok := np.podConfigStore.GetPodConfig(podUID)
+		if !ok {
+			continue
+		}
+		for _, config := range podConfig.DeviceConfigs {
+			if config.Claim != claimNN || config.VFIODevice == nil {
+				continue
+			}
+			if err := restoreDriver(config.VFIODevice.PCIAddress, config.VFIODevice.OriginalDriver); err != nil {
+				klog.Errorf("Failed to restore driver for VFIO device %s: %v", config.VFIODevice.PCIAddress, err)
+			}
+		}
+	}
+	if np.cdiMgr != nil {
+		if err := np.cdiMgr.DeleteSpec(string(claim.UID)); err != nil {
+			klog.Errorf("Failed to delete CDI spec for claim %s: %v", claim.UID, err)
+		}
+	}
+
+	np.podConfigStore.DeleteClaim(claimNN)
 	return nil
 }
 
