@@ -16,9 +16,19 @@ limitations under the License.
 
 package apis
 
+const (
+	ModeNetdev = "netdev"
+	ModeVFIO   = "vfio"
+)
+
 // NetworkConfig represents the desired state of all network interfaces and their associated routes,
 // along with ethtool and sysctl configurations to be applied within the Pod's network namespace.
 type NetworkConfig struct {
+	// Mode selects the operating mode for this device.
+	// "netdev" (default): move the network interface into the pod namespace and configure it.
+	// "vfio": bind the PCI device to vfio-pci and expose via CDI device nodes for VM passthrough.
+	Mode string `json:"mode,omitempty"`
+
 	// Interface defines core properties of the network interface.
 	// Settings here are typically managed by `ip link` commands.
 	Interface InterfaceConfig `json:"interface"`

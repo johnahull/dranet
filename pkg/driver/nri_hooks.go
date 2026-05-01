@@ -173,6 +173,20 @@ func (np *NetworkDriver) runPodSandbox(_ context.Context, pod *api.PodSandbox, p
 			WithDriver(np.driverName).
 			WithPool(np.nodeName)
 
+		// VFIO devices are handled via CDI specs — skip NRI netdev/RDMA processing.
+		if config.VFIODevice != nil {
+			klog.V(4).Infof("RunPodSandbox: skipping VFIO device %s (handled via CDI)", deviceName)
+			resourceClaimStatusDevice.WithConditions(
+				metav1apply.Condition().
+					WithType("Ready").
+					WithReason("VFIODeviceReady").
+					WithStatus(metav1.ConditionTrue).
+					WithLastTransitionTime(metav1.Now()),
+			)
+			resourceClaimStatus.WithDevices(resourceClaimStatusDevice)
+			continue
+		}
+
 		ifName := config.NetworkInterfaceConfigInHost.Interface.Name
 
 		// Block 1: netdev operations — only when a network interface is present.
@@ -379,6 +393,11 @@ func (np *NetworkDriver) stopPodSandbox(_ context.Context, pod *api.PodSandbox, 
 		}
 	}
 	for deviceName, config := range podConfig.DeviceConfigs {
+		if config.VFIODevice != nil {
+			klog.V(4).Infof("StopPodSandbox: skipping VFIO device %s (driver restored on unprepare)", deviceName)
+			continue
+		}
+
 		ifName := config.NetworkInterfaceConfigInPod.Interface.Name
 		if ifName != "" {
 			if err := nsDetachNetdev(ns, ifName, config.NetworkInterfaceConfigInHost.Interface.Name); err != nil {
