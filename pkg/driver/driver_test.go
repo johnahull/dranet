@@ -69,6 +69,8 @@ func (m *fakeInventoryDB) IsIBOnlyDevice(_ string) bool { return false }
 
 func (m *fakeInventoryDB) GetRDMADeviceName(_ string) (string, error) { return "", nil }
 
+func (m *fakeInventoryDB) GetPCIAddress(_ string) (string, error) { return "", nil }
+
 func (m *fakeInventoryDB) AddPodNetNs(podKey string, netNs string) {
 	m.podNetNs[podKey] = netNs
 }

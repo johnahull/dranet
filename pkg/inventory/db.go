@@ -21,7 +21,10 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -284,14 +287,21 @@ func (db *DB) discoverPCIDevices() []resourceapi.Device {
 		}
 
 		if pciDev.Node != nil {
-			device.Attributes[apis.AttrNUMANode] = resourceapi.DeviceAttribute{IntValue: ptr.To(int64(pciDev.Node.ID))}
+			numaNode := int64(pciDev.Node.ID)
+			device.Attributes[apis.AttrNUMANode] = resourceapi.DeviceAttribute{IntValue: ptr.To(numaNode)}
+			device.Attributes["resource.kubernetes.io/numaNode"] = resourceapi.DeviceAttribute{IntValue: ptr.To(numaNode)}
+			if socketID, err := getSocketByNUMANode(numaNode); err == nil {
+				device.Attributes["resource.kubernetes.io/cpuSocketID"] = resourceapi.DeviceAttribute{IntValue: ptr.To(socketID)}
+			}
 		}
+		device.Attributes["resource.kubernetes.io/pciBusID"] = resourceapi.DeviceAttribute{StringValue: &pciDev.Address}
 
 		pcieRootAttr, err := deviceattribute.GetPCIeRootAttributeByPCIBusID(pciDev.Address)
 		if err != nil {
 			klog.Infof("Could not get pci root attribute: %v", err)
 		} else {
 			device.Attributes[pcieRootAttr.Name] = pcieRootAttr.Value
+			device.Attributes["resource.kubernetes.io/pcieRoot"] = pcieRootAttr.Value
 		}
 		devices = append(devices, device)
 	}
@@ -434,9 +444,7 @@ func addLinkAttributes(device *resourceapi.Device, link netlink.Link) {
 	}
 
 	isSriovVirtualFunction := isSriovVf(ifName, sysnetPath)
-	if isSriovVirtualFunction {
-		device.Attributes[apis.AttrIsSriovVf] = resourceapi.DeviceAttribute{BoolValue: &isSriovVirtualFunction}
-	}
+	device.Attributes[apis.AttrIsSriovVf] = resourceapi.DeviceAttribute{BoolValue: &isSriovVirtualFunction}
 
 	if isVirtual(ifName, sysnetPath) {
 		device.Attributes[apis.AttrVirtual] = resourceapi.DeviceAttribute{BoolValue: ptr.To(true)}
@@ -526,6 +534,20 @@ func (db *DB) GetDeviceConfig(deviceName string) (*apis.NetworkConfig, bool) {
 	return conf, exists
 }
 
+func (db *DB) GetPCIAddress(deviceName string) (string, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	device, exists := db.deviceStore[deviceName]
+	if !exists {
+		return "", fmt.Errorf("device %s not found", deviceName)
+	}
+	attr, ok := device.Attributes[apis.AttrPCIAddress]
+	if !ok || attr.StringValue == nil {
+		return "", fmt.Errorf("device %s has no PCI address", deviceName)
+	}
+	return *attr.StringValue, nil
+}
+
 // GetNetInterfaceName returns the network interface name for a given device. It
 // first attempts to retrieve the name from the local device store. If the
 // device is not found, it triggers a rescan of the system's devices and retries
@@ -590,4 +612,21 @@ func (db *DB) GetRDMADeviceName(deviceName string) (string, error) {
 // https://pcisig.com/sites/default/files/files/PCI_Code-ID_r_1_11__v24_Jan_2019.pdf
 func isNetworkDevice(dev *ghw.PCIDevice) bool {
 	return dev.Class.ID == "02"
+}
+
+// getSocketByNUMANode reads the first CPU on a NUMA node and returns its physical_package_id.
+func getSocketByNUMANode(numaNode int64) (int64, error) {
+	cpulistPath := filepath.Join("/sys/devices/system/node", fmt.Sprintf("node%d", numaNode), "cpulist")
+	data, err := os.ReadFile(cpulistPath)
+	if err != nil {
+		return 0, err
+	}
+	firstCPU := strings.Split(strings.TrimSpace(string(data)), ",")[0]
+	firstCPU = strings.Split(firstCPU, "-")[0]
+	socketPath := filepath.Join("/sys/devices/system/cpu", fmt.Sprintf("cpu%s", firstCPU), "topology/physical_package_id")
+	socketData, err := os.ReadFile(socketPath)
+	if err != nil {
+		return 0, err
+	}
+	return strconv.ParseInt(strings.TrimSpace(string(socketData)), 10, 64)
 }

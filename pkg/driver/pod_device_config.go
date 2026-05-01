@@ -56,6 +56,18 @@ type DeviceConfig struct {
 	// RDMADevice holds RDMA-specific configurations if the network device
 	// has associated RDMA capabilities.
 	RDMADevice RDMAConfig `json:"rdmaDevice,omitempty"`
+
+	// VFIODevice holds VFIO-specific state when the device is bound to vfio-pci
+	// for VM passthrough. Nil for normal netdev mode.
+	VFIODevice *VFIOConfig `json:"vfioDevice,omitempty"`
+}
+
+// VFIOConfig holds state for a PCI device bound to vfio-pci.
+type VFIOConfig struct {
+	PCIAddress           string `json:"pciAddress"`
+	OriginalDriver       string `json:"originalDriver"`
+	VFIOGroupDevPath     string `json:"vfioGroupDevPath"`
+	VFIOContainerDevPath string `json:"vfioContainerDevPath"`
 }
 
 // RDMAConfig contains parameters for setting up an RDMA device associated
